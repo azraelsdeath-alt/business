@@ -7,52 +7,78 @@
  *
  * GET /api/auth/login?demo=<token>
  * Demo user login bypass using seed data tokens
+ *
+ * Returns 503 with a clear message when DATABASE_URL is not set.
  */
 
-import { json } from "@tanstack/react-start";
-import { createAPIFileRoute } from "@tanstack/react-start/api";
+import { createFileRoute } from "@tanstack/react-router";
 import { loginUser, loginWithDemoToken, setSessionCookie } from "~/services/auth";
+import { errorResponse, hasDatabase, jsonResponse, MESSAGES } from "~/lib/server/env";
 
-export const APIRoute = createAPIFileRoute("/api/auth/login")({
-  POST: async ({ request }) => {
-    try {
-      const body = await request.json() as { email: string; password: string };
-      const result = await loginUser(body);
+function sessionResponse(
+  body: unknown,
+  token: string,
+  status: number,
+): Response {
+  const response = jsonResponse(body, status);
+  response.headers.append("Set-Cookie", setSessionCookie(token));
+  return response;
+}
 
-      if (!result.success || !result.token) {
-        return json(result, { status: 401 });
-      }
+export const Route = createFileRoute("/api/auth/login")({
+  server: {
+    handlers: {
+      POST: async ({ request }) => {
+        if (!hasDatabase()) {
+          return jsonResponse(
+            { success: false, error: MESSAGES.database, missing: ["DATABASE_URL"] },
+            503,
+          );
+        }
 
-      const headers = new Headers();
-      headers.append("Set-Cookie", setSessionCookie(result.token));
+        try {
+          const body = (await request.json()) as { email: string; password: string };
+          const result = await loginUser(body);
 
-      return json(
-        { success: true, user: result.user },
-        { headers },
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error";
-      return json({ success: false, error: message }, { status: 500 });
-    }
-  },
+          if (!result.success || !result.token) {
+            return jsonResponse(result, 401);
+          }
 
-  // Demo login via query param
-  GET: async ({ request }) => {
-    const url = new URL(request.url);
-    const demoToken = url.searchParams.get("demo");
+          return sessionResponse({ success: true, user: result.user }, result.token, 200);
+        } catch (error) {
+          return errorResponse(error);
+        }
+      },
 
-    if (demoToken) {
-      const result = await loginWithDemoToken(demoToken);
-      if (result.success && result.token) {
-        const headers = new Headers();
-        headers.append("Set-Cookie", setSessionCookie(result.token));
-        return json(
-          { success: true, user: result.user },
-          { headers },
-        );
-      }
-    }
+      // Demo login via query param
+      GET: async ({ request }) => {
+        if (!hasDatabase()) {
+          return jsonResponse(
+            { success: false, error: MESSAGES.database, missing: ["DATABASE_URL"] },
+            503,
+          );
+        }
 
-    return json({ success: false, error: "Not authenticated" }, { status: 401 });
+        try {
+          const url = new URL(request.url);
+          const demoToken = url.searchParams.get("demo");
+
+          if (demoToken) {
+            const result = await loginWithDemoToken(demoToken);
+            if (result.success && result.token) {
+              return sessionResponse(
+                { success: true, user: result.user },
+                result.token,
+                200,
+              );
+            }
+          }
+
+          return jsonResponse({ success: false, error: "Not authenticated" }, 401);
+        } catch (error) {
+          return errorResponse(error);
+        }
+      },
+    },
   },
 });

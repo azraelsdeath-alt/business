@@ -3,51 +3,109 @@
  *
  * GET /api/oauth/youtube
  *
- * Requires an authenticated session. Generates a CSRF state, stores it in a
- * short-lived cookie, and redirects the browser to Google's OAuth consent
- * screen. Google then redirects back to /api/oauth/youtube/callback.
+ * Requires an authenticated session. Creates a CSRF state + PKCE pair, stores
+ * them in short-lived cookies, and redirects the browser to Google's OAuth
+ * consent screen. Google then redirects back to /api/oauth/youtube/callback.
  *
- * Frontend: link the "Connect YouTube" button to this URL.
+ * Add `?format=json` (or send `Accept: application/json`) to get the authorize
+ * URL as JSON instead of a redirect — useful for a "Connect YouTube" button
+ * that wants to open a popup.
+ *
+ * Degrades with a clear message when GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET or
+ * DATABASE_URL are not set, instead of throwing.
  */
 
-import { createAPIFileRoute } from "@tanstack/react-start/api";
-import { json } from "@tanstack/react-start";
-import { randomBytes } from "node:crypto";
+import { createFileRoute } from "@tanstack/react-router";
 import { getSessionUser } from "~/services/auth";
-import { buildGoogleAuthUrl, isGoogleOAuthConfigured } from "~/services/youtube";
+import {
+  buildGoogleAuthUrl,
+  createPkcePair,
+  createState,
+  isGoogleOAuthConfigured,
+  resolveRedirectUri,
+} from "~/services/youtube";
+import {
+  MESSAGES,
+  errorResponse,
+  hasDatabase,
+  jsonResponse,
+} from "~/lib/server/env";
 
-export const APIRoute = createAPIFileRoute("/api/oauth/youtube")({
-  GET: async ({ request }) => {
-    try {
-      const user = await getSessionUser(request);
-      if (!user) {
-        return json({ success: false, error: "Unauthorized" }, { status: 401 });
-      }
+const STATE_COOKIE = "oauth_state";
+const PKCE_COOKIE = "oauth_pkce";
+const REDIRECT_COOKIE = "oauth_redirect";
+const COOKIE_MAX_AGE = 600; // 10 minutes — one consent round trip
 
-      if (!isGoogleOAuthConfigured()) {
-        return json(
-          {
-            success: false,
-            error:
-              "Google OAuth is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI.",
-          },
-          { status: 503 },
-        );
-      }
+function oauthCookie(name: string, value: string, request: Request): string {
+  const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
+  return `${name}=${encodeURIComponent(value)}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE}${secure}`;
+}
 
-      const state = randomBytes(16).toString("hex");
-      const authUrl = buildGoogleAuthUrl(state);
+export const Route = createFileRoute("/api/oauth/youtube")({
+  server: {
+    handlers: {
+      GET: async ({ request }) => {
+        const url = new URL(request.url);
+        const wantsJson =
+          url.searchParams.get("format") === "json" ||
+          (request.headers.get("accept") ?? "").includes("application/json");
 
-      return new Response(null, {
-        status: 302,
-        headers: {
-          Location: authUrl,
-          "Set-Cookie": `oauth_state=${state}; HttpOnly; Path=/; SameSite=Lax; Max-Age=600`,
-        },
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error";
-      return json({ success: false, error: message }, { status: 500 });
-    }
+        if (!isGoogleOAuthConfigured()) {
+          return jsonResponse(
+            {
+              success: false,
+              error: MESSAGES.google,
+              missing: ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],
+            },
+            503,
+          );
+        }
+
+        if (!hasDatabase()) {
+          return jsonResponse(
+            { success: false, error: MESSAGES.database, missing: ["DATABASE_URL"] },
+            503,
+          );
+        }
+
+        try {
+          const user = await getSessionUser(request);
+          if (!user) {
+            return jsonResponse(
+              {
+                success: false,
+                error: "Sign in before connecting a YouTube channel.",
+                signIn: "/login",
+              },
+              401,
+            );
+          }
+
+          const state = createState();
+          const pkce = createPkcePair();
+          const redirectUri = resolveRedirectUri(request);
+          const authUrl = buildGoogleAuthUrl({
+            state,
+            redirectUri,
+            codeChallenge: pkce.challenge,
+          });
+
+          const response = wantsJson
+            ? jsonResponse({ success: true, authUrl, redirectUri })
+            : new Response(null, { status: 302, headers: { Location: authUrl } });
+
+          response.headers.append("Set-Cookie", oauthCookie(STATE_COOKIE, state, request));
+          response.headers.append("Set-Cookie", oauthCookie(PKCE_COOKIE, pkce.verifier, request));
+          response.headers.append(
+            "Set-Cookie",
+            oauthCookie(REDIRECT_COOKIE, redirectUri, request),
+          );
+
+          return response;
+        } catch (error) {
+          return errorResponse(error);
+        }
+      },
+    },
   },
 });
