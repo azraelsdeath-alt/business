@@ -3,82 +3,105 @@
  *
  * GET /api/oauth/youtube/callback
  *
- * This is the `GOOGLE_REDIRECT_URI` that Google redirects back to after the
- * user consents. It:
+ * This is the URL Google redirects back to after the user consents (register it
+ * in Google Cloud as the OAuth client's redirect URI — the start route derives
+ * it from the request, or you can pin it with GOOGLE_REDIRECT_URI). It:
+ *
  *   1. Verifies the CSRF `state` against the `oauth_state` cookie
  *   2. Identifies the user from their existing session cookie
- *   3. Exchanges the authorization code for tokens
+ *   3. Exchanges the authorization code (+ PKCE verifier) for tokens
  *   4. Fetches the YouTube channel and persists the connection
  *   5. Redirects back to /settings with a status query
+ *
+ * Every failure path redirects to /settings with a readable `youtube_error`
+ * instead of throwing, so a missing secret or a denied consent never 500s.
  */
 
-import { createAPIFileRoute } from "@tanstack/react-start/api";
-import { json } from "@tanstack/react-start";
+import { createFileRoute } from "@tanstack/react-router";
 import { getSessionUser } from "~/services/auth";
 import {
   exchangeCodeForTokens,
   fetchYouTubeChannel,
+  isGoogleOAuthConfigured,
+  resolveRedirectUri,
   upsertYouTubeConnection,
 } from "~/services/youtube";
+import { MESSAGES, hasDatabase } from "~/lib/server/env";
 
-function getCookie(request: Request, name: string): string | null {
+const STATE_COOKIE = "oauth_state";
+const PKCE_COOKIE = "oauth_pkce";
+const REDIRECT_COOKIE = "oauth_redirect";
+
+function readCookie(request: Request, name: string): string | null {
   const cookie = request.headers.get("Cookie");
   if (!cookie) return null;
   const match = cookie.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
   return match ? decodeURIComponent(match[1]) : null;
 }
 
-function redirect(location: string): Response {
-  return new Response(null, {
-    status: 302,
-    headers: {
-      Location: location,
-      // Clear the one-time state cookie regardless of outcome
-      "Set-Cookie": "oauth_state=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0",
-    },
-  });
+function clearCookie(name: string, request: Request): string {
+  const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
+  return `${name}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0${secure}`;
 }
 
-export const APIRoute = createAPIFileRoute("/api/oauth/youtube/callback")({
-  GET: async ({ request }) => {
-    const url = new URL(request.url);
-    const error = url.searchParams.get("error");
-    const code = url.searchParams.get("code");
-    const state = url.searchParams.get("state");
+function redirect(request: Request, location: string): Response {
+  const response = new Response(null, { status: 302, headers: { Location: location } });
+  for (const name of [STATE_COOKIE, PKCE_COOKIE, REDIRECT_COOKIE]) {
+    response.headers.append("Set-Cookie", clearCookie(name, request));
+  }
+  return response;
+}
 
-    try {
-      // User denied consent or Google returned an error
-      if (error) {
-        return redirect(`/settings?youtube_error=${encodeURIComponent(error)}`);
-      }
+function fail(request: Request, message: string): Response {
+  return redirect(request, `/settings?youtube_error=${encodeURIComponent(message)}`);
+}
 
-      if (!code || !state) {
-        return redirect("/settings?youtube_error=missing_code_or_state");
-      }
+export const Route = createFileRoute("/api/oauth/youtube/callback")({
+  server: {
+    handlers: {
+      GET: async ({ request }) => {
+        const url = new URL(request.url);
+        const error = url.searchParams.get("error");
+        const code = url.searchParams.get("code");
+        const state = url.searchParams.get("state");
 
-      // Verify CSRF state
-      const stateCookie = getCookie(request, "oauth_state");
-      if (!stateCookie || stateCookie !== state) {
-        return json({ success: false, error: "Invalid OAuth state" }, { status: 400 });
-      }
+        // User denied consent, or Google returned an error
+        if (error) return fail(request, `Google returned: ${error}`);
+        if (!code || !state) return fail(request, "Google did not return an authorization code.");
 
-      // Identify the user from their session cookie
-      const user = await getSessionUser(request);
-      if (!user) {
-        return json({ success: false, error: "Unauthorized" }, { status: 401 });
-      }
+        if (!isGoogleOAuthConfigured()) return fail(request, MESSAGES.google);
+        if (!hasDatabase()) return fail(request, MESSAGES.database);
 
-      // Exchange code → tokens, fetch channel, persist connection
-      const tokens = await exchangeCodeForTokens(code);
-      const channel = await fetchYouTubeChannel(tokens.access_token);
-      await upsertYouTubeConnection(user.id, tokens, channel);
+        const stateCookie = readCookie(request, STATE_COOKIE);
+        if (!stateCookie || stateCookie !== state) {
+          return fail(
+            request,
+            "OAuth state check failed — start the connection again from Settings.",
+          );
+        }
 
-      return redirect(
-        `/settings?youtube_connected=1&channel=${encodeURIComponent(channel.title)}`,
-      );
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Unknown error";
-      return redirect(`/settings?youtube_error=${encodeURIComponent(message)}`);
-    }
+        try {
+          const user = await getSessionUser(request);
+          if (!user) {
+            return fail(request, "Your session expired — sign in and connect YouTube again.");
+          }
+
+          const redirectUri = readCookie(request, REDIRECT_COOKIE) ?? resolveRedirectUri(request);
+          const codeVerifier = readCookie(request, PKCE_COOKIE) ?? undefined;
+
+          const tokens = await exchangeCodeForTokens(code, { redirectUri, codeVerifier });
+          const channel = await fetchYouTubeChannel(tokens.access_token);
+          await upsertYouTubeConnection(user.id, tokens, channel);
+
+          return redirect(
+            request,
+            `/settings?youtube_connected=1&channel=${encodeURIComponent(channel.title)}`,
+          );
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Unknown error";
+          return fail(request, message);
+        }
+      },
+    },
   },
 });
